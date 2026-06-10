@@ -1,0 +1,16 @@
+name: 03-04-ceos-intfmap
+
+topology:
+  kinds:
+    arista_ceos:
+      image: ceos:4.32.0F
+      env:
+        INTF_MAP_ETH0: Management1
+  nodes:
+    n1:
+      kind: arista_ceos
+    n2:
+      kind: arista_ceos
+
+  links:
+    - endpoints: ["n1:eth1_1", "n2:eth1_1"]
