@@ -36,6 +36,19 @@ const (
 	tlsKeyFile  = "node.key"
 	tlsCertFile = "node.crt"
 	tlsCAFile   = "ca.crt"
+
+	// eosIntfMappingFile is the file cEOS reads to remap kernel netdevs to EOS
+	// interface names. containerlab writes it into the node's flash directory
+	// (mounted at /mnt/flash) when interface-map autogeneration is requested.
+	eosIntfMappingFile = "EosIntfMapping.json"
+
+	// intfMapEnvVar, when set on a ceos node (e.g. INTF_MAP_ETH0=Management1),
+	// opts the node into containerlab generating an EosIntfMapping.json that
+	// renames the management interface (eth0) to the given EOS interface name
+	// while preserving data interface names. It mirrors the cEOS image
+	// environment variable of the same name, so topologies remain valid once the
+	// image supports it natively.
+	intfMapEnvVar = "INTF_MAP_ETH0"
 )
 
 var (
@@ -58,6 +71,15 @@ var (
 	saveCmd = "Cli -p 15 -c wr"
 
 	defaultCredentials = clabnodes.NewCredentials("admin", "admin")
+
+	// mgmtIntfNameRegexp matches a valid EOS management interface name
+	// (e.g. Management1) accepted as the INTF_MAP_ETH0 value.
+	mgmtIntfNameRegexp = regexp.MustCompile(`^Management[0-9]+$`)
+
+	// dataIntfNameRegexp parses a containerlab cEOS data interface name into its
+	// numeric label and optional breakout sub-labels: ethX, etX, or the
+	// ethX_Y[_Z] shorthand (capture groups: X, Y, Z).
+	dataIntfNameRegexp = regexp.MustCompile(`^(?:eth|et)([0-9]+)(?:_([0-9]+))?(?:_([0-9]+))?$`)
 )
 
 // Register registers the node in the NodeRegistry.
@@ -83,14 +105,12 @@ type ceos struct {
 	clabnodes.DefaultNode
 }
 
-// intfMap represents interface mapping config file.
-type intfMap struct {
-	ManagementIntf struct {
-		Eth0 string `json:"eth0"`
-	} `json:"ManagementIntf"`
-	EthernetIntf struct {
-		eth map[string]string
-	} `json:"EthernetIntf"`
+// eosIntfMapping represents the cEOS interface mapping file
+// (/mnt/flash/EosIntfMapping.json). Each section maps a kernel netdev name to
+// the EOS interface name cEOS should expose it as.
+type eosIntfMapping struct {
+	ManagementIntf map[string]string `json:"ManagementIntf"`
+	EthernetIntf   map[string]string `json:"EthernetIntf"`
 }
 
 func (n *ceos) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) error {
@@ -106,6 +126,18 @@ func (n *ceos) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) err
 	}
 
 	n.Cfg.Env = clabutils.MergeStringMaps(ceosEnv, n.Cfg.Env)
+
+	// If the user binds their own EosIntfMapping.json, INTF_MAP_ETH0 must not
+	// reach the container, so the bound file stays authoritative even on a
+	// future cEOS image that consumes the variable natively. Strip it here,
+	// before the environment is baked into n.Cfg.Cmd below.
+	if _, ok := n.Cfg.Env[intfMapEnvVar]; ok && userProvidedIntfMapping(n.Cfg) {
+		log.Warnf(
+			"node %q sets %s but also binds its own %s; the bound file is used and %s is ignored",
+			n.Cfg.ShortName, intfMapEnvVar, eosIntfMappingFile, intfMapEnvVar,
+		)
+		delete(n.Cfg.Env, intfMapEnvVar)
+	}
 
 	// the node.Cmd should be aligned with the environment.
 	// prepending original Cmd with if-wait.sh script to make sure that interfaces are available
@@ -206,10 +238,19 @@ func (n *ceos) createCEOSFiles(ctx context.Context) error {
 	nodeCfg.MgmtIPv4Gateway = n.Runtime.Mgmt().IPv4Gw
 	nodeCfg.MgmtIPv6Gateway = n.Runtime.Mgmt().IPv6Gw
 
-	// set the mgmt interface name for the node
-	err := setMgmtInterface(nodeCfg)
+	// when the node opts into interface-map autogeneration (INTF_MAP_ETH0), write
+	// the generated EosIntfMapping.json into the flash dir and derive the mgmt
+	// interface name from it. Otherwise fall back to a user-provided map bind or
+	// the Management0 default.
+	generated, err := n.genIntfMapping(nodeCfg)
 	if err != nil {
 		return err
+	}
+	if !generated {
+		// set the mgmt interface name for the node
+		if err := setMgmtInterface(nodeCfg); err != nil {
+			return err
+		}
 	}
 
 	// use startup config file provided by a user
@@ -309,7 +350,7 @@ func setMgmtInterface(node *clabtypes.NodeConfig) error {
 	// default is Management0
 	mgmtInterface := "Management0"
 	for _, bindelement := range node.Binds {
-		if !strings.Contains(bindelement, "EosIntfMapping.json") {
+		if !strings.Contains(bindelement, eosIntfMappingFile) {
 			continue
 		}
 
@@ -325,7 +366,7 @@ func setMgmtInterface(node *clabtypes.NodeConfig) error {
 		}
 
 		// Reset management interface if defined in the intfMapping file
-		var intfMappingJson intfMap
+		var intfMappingJson eosIntfMapping
 		err = json.Unmarshal(m, &intfMappingJson)
 		if err != nil {
 			log.Debugf(
@@ -334,12 +375,121 @@ func setMgmtInterface(node *clabtypes.NodeConfig) error {
 			)
 			return err
 		}
-		mgmtInterface = intfMappingJson.ManagementIntf.Eth0
+		if v := intfMappingJson.ManagementIntf["eth0"]; v != "" {
+			mgmtInterface = v
+		}
 	}
 	log.Debugf("Management interface for '%s' node is set to %s.", node.ShortName, mgmtInterface)
 	node.MgmtIntf = mgmtInterface
 
 	return nil
+}
+
+// userProvidedIntfMapping reports whether the user already binds an
+// EosIntfMapping.json, in which case containerlab must not generate one.
+func userProvidedIntfMapping(node *clabtypes.NodeConfig) bool {
+	for _, b := range node.Binds {
+		if strings.Contains(b, eosIntfMappingFile) {
+			return true
+		}
+	}
+	return false
+}
+
+// dataIntfToEosName converts a containerlab cEOS data interface name (ethX, etX,
+// or the ethX_Y[_Z] breakout shorthand) to its EOS interface name (EthernetX,
+// EthernetX/Y or EthernetX/Y/Z). This reproduces the conversion the cEOS image
+// performs itself when no interface mapping file is present, so that generating
+// a mapping file does not lose the underscore shorthand.
+func dataIntfToEosName(ifName string) (string, error) {
+	m := dataIntfNameRegexp.FindStringSubmatch(ifName)
+	if m == nil {
+		return "", fmt.Errorf(
+			"cannot map interface %q to an EOS interface name. "+
+				"%s interface-map autogeneration supports ethX/etX and the "+
+				"ethX_Y[_Z]/etX_Y[_Z] breakout shorthand; dotted subinterface names such as "+
+				"eth1.100 are not supported (cEOS does not expose them via the interface "+
+				"mapping file). Unset %s for this node, or configure subinterfaces "+
+				"in the node's startup-config instead",
+			ifName, intfMapEnvVar, intfMapEnvVar,
+		)
+	}
+
+	name := "Ethernet" + m[1]
+	if m[2] != "" {
+		name += "/" + m[2]
+	}
+	if m[3] != "" {
+		name += "/" + m[3]
+	}
+	return name, nil
+}
+
+// genIntfMapping reconciles the node's EosIntfMapping.json with the
+// INTF_MAP_ETH0 environment variable. When set, it generates a mapping that maps
+// eth0 to the requested management interface name and every data interface to
+// its EOS name (preserving the ethX_Y -> EthernetX/Y shorthand, which a mapping
+// file would otherwise disable), writes the file into the node's flash
+// directory, sets the node's management interface name, and returns true.
+//
+// When INTF_MAP_ETH0 is unset (including the case where Init removed it because
+// the user binds their own mapping file), it removes any mapping file left in
+// the flash directory by a previous autogen run — so redeploying after unsetting
+// the variable does not keep applying a stale map — and returns false, leaving
+// the user-provided / Management0 handling in place. A user-provided map is
+// bound from outside the flash directory, so the removal only targets a stale
+// generated file.
+func (n *ceos) genIntfMapping(node *clabtypes.NodeConfig) (bool, error) {
+	mapPath := path.Join(node.LabDir, "flash", eosIntfMappingFile)
+
+	mgmtName, ok := node.Env[intfMapEnvVar]
+	if !ok {
+		if err := os.Remove(mapPath); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf(
+				"failed to remove stale %s for node %q: %w",
+				eosIntfMappingFile, node.ShortName, err,
+			)
+		}
+		return false, nil
+	}
+
+	if !mgmtIntfNameRegexp.MatchString(mgmtName) {
+		return false, fmt.Errorf(
+			"node %q: %s value %q is not a valid management interface name (expected e.g. Management1)",
+			node.ShortName, intfMapEnvVar, mgmtName,
+		)
+	}
+
+	mapping := eosIntfMapping{
+		ManagementIntf: map[string]string{"eth0": mgmtName},
+		EthernetIntf:   map[string]string{},
+	}
+	for _, e := range n.Endpoints {
+		ifName := e.GetIfaceName()
+		if ifName == "eth0" {
+			continue
+		}
+		eosName, err := dataIntfToEosName(ifName)
+		if err != nil {
+			return false, fmt.Errorf("node %q: %w", node.ShortName, err)
+		}
+		mapping.EthernetIntf[ifName] = eosName
+	}
+
+	b, err := json.MarshalIndent(mapping, "", "  ")
+	if err != nil {
+		return false, err
+	}
+
+	if err := clabutils.CreateFile(mapPath, string(b)); err != nil {
+		return false, fmt.Errorf("failed to write %s for node %q: %w", eosIntfMappingFile, node.ShortName, err)
+	}
+
+	node.MgmtIntf = mgmtName
+	log.Debugf("Management interface for '%s' node is set to %s (generated %s).",
+		node.ShortName, mgmtName, eosIntfMappingFile)
+
+	return true, nil
 }
 
 // ceosPostDeploy runs postdeploy actions which are required for ceos nodes.
